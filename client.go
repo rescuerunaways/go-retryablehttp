@@ -586,79 +586,83 @@ func PassthroughErrorHandler(resp *http.Response, err error, _ int) (*http.Respo
 	return resp, err
 }
 
-func (c *Client) MultithreadedDo(length int, startTime time.Time, url string) error {
-
-	// length int
-	//starttime time.Time
+func (c *Client) MultithreadedDo(length int, startTime time.Time, url string) ([]byte, error) {
 
 	fmt.Println("Starting threaded download...")
 	size := length / c.Threads
 	remainder := length % c.Threads
-	//	fmt.Println("Downloading %s on %d threads", c.filename, c.Threads)
-	fmt.Println("Downloading %s on %d threads", "", c.Threads)
+	fmt.Println("Downloading on %d threads", c.Threads)
+
+	var data = make([]byte, length) // Combined data aggregator
+	var errData error               // Error data from threads
+	var mu sync.Mutex               // Mutex to protect concurrent writes to data
+
 	wg := &sync.WaitGroup{}
 	for i := 0; i < c.Threads; i++ {
 		wg.Add(1)
 
 		start := i * size
 		end := (i + 1) * size
-
 		if i == c.Threads-1 {
 			end += remainder
 		}
 
-		fmt.Println("Starting thread %d", i)
-		go func(start, end, i int) error {
+		fmt.Println("Starting thread", i)
+		go func(start, end, i int) {
+			defer wg.Done()
+
 			req, err := http.NewRequest("GET", url, nil)
 			if err != nil {
-				wg.Done()
-				return err
+				mu.Lock()
+				errData = err
+				mu.Unlock()
+				return
 			}
 			byteRange := fmt.Sprintf("bytes=%d-%d", start, end-1)
 			req.Header.Add("Range", byteRange)
+
 			resp, err := c.HTTPClient.Do(req)
 			if err != nil {
-				wg.Done()
-				return err
+				mu.Lock()
+				errData = err
+				mu.Unlock()
+				return
 			}
 			defer resp.Body.Close()
-			fmt.Println("Thread: %d Reading response body", i)
+
+			fmt.Println("Thread:", i, "Reading response body")
 			body, err := ioutil.ReadAll(resp.Body)
 			if err != nil {
-				wg.Done()
-				return err
+				mu.Lock()
+				errData = err
+				mu.Unlock()
+				return
 			}
-			//	file, err := os.OpenFile(c.filename, os.O_WRONLY|os.O_CREATE, 0666)
-			file, err := os.OpenFile("", os.O_WRONLY|os.O_CREATE, 0666) //TODO: writes to disk!
-			if err != nil {
-				wg.Done()
-				return err
-			}
-			defer file.Close()
-			io.Copy(file, resp.Body)
-			fmt.Println("Thread: %d writing bytes %d - %d", i, start, end)
-			file.WriteAt(body, int64(start))
-			wg.Done()
 
-			fmt.Println("Thread: %d done", i)
+			mu.Lock()
+			copy(data[start:], body)
+			mu.Unlock()
 
-			return nil
+			fmt.Println("Thread:", i, "done")
 		}(start, end, i)
 	}
+
 	wg.Wait()
-	//	fmt.Println("Downloaded %s in %s", c.filename, time.Now().Sub(startTime))
-	fmt.Println("Downloaded %s in %s", "", time.Now().Sub(startTime))
 
-	//TODO expected http Response here
+	fmt.Println("Downloaded in", time.Now().Sub(startTime))
 
-	return nil
+	if errData != nil {
+		return nil, errData
+	}
+	return data, nil
+
 }
 
-func (c *Client) DoCheckLength(url string) (http.Response, error) {
+func (c *Client) DoCheckLength(url string) ([]byte, error) {
 	startTime := time.Now()
 	resp, err := c.HTTPClient.Head(url)
 	if err != nil {
-		return err
+		return []byte{}, err
 	}
 	contentLength := resp.Header.Get("Content-Length")
 
@@ -678,7 +682,7 @@ func (c *Client) DoCheckLength(url string) (http.Response, error) {
 	//}
 	length, err := strconv.Atoi(contentLength)
 	if err != nil {
-		return err
+		return []byte{}, err
 	}
 	return c.MultithreadedDo(length, startTime, url)
 }
@@ -739,7 +743,12 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 		// Attempt the request
 
 		//	resp, doErr = c.HTTPClient.Do(req.Request)
-		resp, doErr = c.DoCheckLength(req.Request.URL.String())
+		bts := []byte{}
+		bts, doErr = c.DoCheckLength(req.Request.URL.String())
+		_, err := resp.Body.Read(bts)
+		if err != nil {
+			return nil, err
+		}
 
 		// Check if we should continue with retries.
 		shouldRetry, checkErr = c.CheckRetry(req.Context(), resp, doErr)
@@ -748,7 +757,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 			shouldRetry, checkErr = c.CheckRetry(req.Context(), resp, respErr)
 		}
 
-		err := doErr
+		err = doErr
 		if respErr != nil {
 			err = respErr
 		}
