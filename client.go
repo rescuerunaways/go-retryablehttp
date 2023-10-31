@@ -408,6 +408,9 @@ type Client struct {
 
 	loggerInit sync.Once
 	clientInit sync.Once
+
+	Threads int
+	Single  bool
 }
 
 // NewClient creates a new Client with default settings.
@@ -420,6 +423,8 @@ func NewClient() *Client {
 		RetryMax:     defaultRetryMax,
 		CheckRetry:   DefaultRetryPolicy,
 		Backoff:      DefaultBackoff,
+		Threads:      10, //multithreading
+		Single:       false,
 	}
 }
 
@@ -581,6 +586,103 @@ func PassthroughErrorHandler(resp *http.Response, err error, _ int) (*http.Respo
 	return resp, err
 }
 
+func (c *Client) MultithreadedDo(length int, startTime time.Time, url string) error {
+
+	// length int
+	//starttime time.Time
+
+	fmt.Println("Starting threaded download...")
+	size := length / c.Threads
+	remainder := length % c.Threads
+	//	fmt.Println("Downloading %s on %d threads", c.filename, c.Threads)
+	fmt.Println("Downloading %s on %d threads", "", c.Threads)
+	wg := &sync.WaitGroup{}
+	for i := 0; i < c.Threads; i++ {
+		wg.Add(1)
+
+		start := i * size
+		end := (i + 1) * size
+
+		if i == c.Threads-1 {
+			end += remainder
+		}
+
+		fmt.Println("Starting thread %d", i)
+		go func(start, end, i int) error {
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				wg.Done()
+				return err
+			}
+			byteRange := fmt.Sprintf("bytes=%d-%d", start, end-1)
+			req.Header.Add("Range", byteRange)
+			resp, err := c.HTTPClient.Do(req)
+			if err != nil {
+				wg.Done()
+				return err
+			}
+			defer resp.Body.Close()
+			fmt.Println("Thread: %d Reading response body", i)
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				wg.Done()
+				return err
+			}
+			//	file, err := os.OpenFile(c.filename, os.O_WRONLY|os.O_CREATE, 0666)
+			file, err := os.OpenFile("", os.O_WRONLY|os.O_CREATE, 0666) //TODO: writes to disk!
+			if err != nil {
+				wg.Done()
+				return err
+			}
+			defer file.Close()
+			io.Copy(file, resp.Body)
+			fmt.Println("Thread: %d writing bytes %d - %d", i, start, end)
+			file.WriteAt(body, int64(start))
+			wg.Done()
+
+			fmt.Println("Thread: %d done", i)
+
+			return nil
+		}(start, end, i)
+	}
+	wg.Wait()
+	//	fmt.Println("Downloaded %s in %s", c.filename, time.Now().Sub(startTime))
+	fmt.Println("Downloaded %s in %s", "", time.Now().Sub(startTime))
+
+	//TODO expected http Response here
+
+	return nil
+}
+
+func (c *Client) DoCheckLength(url string) (http.Response, error) {
+	startTime := time.Now()
+	resp, err := c.HTTPClient.Head(url)
+	if err != nil {
+		return err
+	}
+	contentLength := resp.Header.Get("Content-Length")
+
+	//TODO what to do with all these?
+	//	ranges := resp.Header.Get("Accept-Ranges")
+
+	//if contentLength == "" {
+	//	return c.Do(req) //singe threaded request
+	//}
+	//
+	//if ranges != "bytes" {
+	//	return c.Do(req)
+	//}
+	//
+	//if c.single || c.threads <= 1 {
+	//	return c.Do(req)
+	//}
+	length, err := strconv.Atoi(contentLength)
+	if err != nil {
+		return err
+	}
+	return c.MultithreadedDo(length, startTime, url)
+}
+
 // Do wraps calling an HTTP method with retries.
 func (c *Client) Do(req *Request) (*http.Response, error) {
 	c.clientInit.Do(func() {
@@ -635,7 +737,9 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 		}
 
 		// Attempt the request
-		resp, doErr = c.HTTPClient.Do(req.Request)
+
+		//	resp, doErr = c.HTTPClient.Do(req.Request)
+		resp, doErr = c.DoCheckLength(req.Request.URL.String())
 
 		// Check if we should continue with retries.
 		shouldRetry, checkErr = c.CheckRetry(req.Context(), resp, doErr)
